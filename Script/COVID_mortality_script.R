@@ -1,0 +1,775 @@
+# loading libraries
+library(tidyverse)
+library(broom)
+library(survival)
+library(data.table)
+library(EValue)
+library(patchwork)
+library(survminer)
+library(ggpubr)
+library(scales)
+library(Cairo)
+library(extrafont)
+
+# importing data
+data_main_analysis <- read_csv("C:/Tomas/AZV_project_health_registers_covid_mortality/Data/data_all_cohorts_all_outcomes.csv")
+
+# re-coding the data
+data_main_analysis <- data_main_analysis %>% 
+  mutate(exposure = ifelse(str_detect(cohort, "KS"), "control", "exposed"),
+         kohorta = cohort,
+         cohort = str_remove(cohort, " KS"),
+         time_to_death_allcause_28 = time_to_umrti_28,
+         time_to_death_allcause_60 = time_to_umrti_60,
+         time_to_death_covid_28 = time_to_umrti_covid_28,
+         time_to_death_covid_60 = time_to_umrti_covid_60,
+         death_covid_28 = umrti_covid_28,
+         death_covid_60 = umrti_covid_60,
+         death_allcause_28 = umrti_28,
+         death_allcause_60 = umrti_60,
+         age_group = vek_skupina,
+         sex = pohlavi,
+         vaccination = ockovani,
+         matching = propojeni_cohort_KS,
+         number_matched = pocet_napojenych_KS,
+         infection_year = pozitivita_rok,
+         infection_month = pozitivita_mesic,
+         ID_patient = ID_pacienta,
+         region_residence = Bydliste_Kraj,
+         DCCI_cat = case_when(DCCI == 0 ~ "0",
+                              DCCI == 1 ~ "1",
+                              DCCI == 2 ~ "2",
+                              DCCI == 3 ~ "3",
+                              DCCI >= 4 ~ "4+"),
+         number_outpatient = case_when(cohort %in% c("F1", "F1 leky") ~ pocet_kontaktu_bezF1,
+                                    cohort %in% c("F2", "F2 leky") ~ pocet_kontaktu_bezF2,
+                                    cohort %in% c("F3", "F3 leky") ~ pocet_kontaktu_bezF3,
+                                    cohort %in% c("F4", "F4 leky") ~ pocet_kontaktu_bezF4,
+                                    cohort %in% c("F1F2F3F4", "F1F2F3F4 leky") ~ pocet_kontaktu_bezF1F2F3F4),
+         number_inpatient = case_when(cohort %in% c("F1", "F1 leky") ~ pocet_hosp_bezF1,
+                                    cohort %in% c("F2", "F2 leky") ~ pocet_hosp_bezF2,
+                                    cohort %in% c("F3", "F3 leky") ~ pocet_hosp_bezF3,
+                                    cohort %in% c("F4", "F4 leky") ~ pocet_hosp_bezF4,
+                                    cohort %in% c("F1F2F3F4", "F1F2F3F4 leky") ~ pocet_hosp_bezF1F2F3F4)) %>% 
+  mutate(exposure_definition = ifelse(str_detect(cohort, "leky"), "diagnosed and treated", "diagnosed"),
+         exp_def = ifelse(exposure_definition == "diagnosed", "dg", "dg & tr"),
+         cohort_ICD = factor(str_remove(cohort, " leky"),
+                             levels = c("F1F2F3F4", "F1", "F2", "F3", "F4"),
+                             labels = c("Fx", "F1", "F2", "F3", "F4"),
+                             ordered = TRUE),
+         cohort = factor(str_remove(cohort, " leky"),
+                         levels = c("F1F2F3F4", "F1", "F2", "F3", "F4"),
+                         labels = c("any mental disorder", "substance use disorders", "psychotic disorders", "affective disorders", "anxiety disorders"),
+                         ordered = TRUE),
+         time_period = factor(as.character(paste0("period ", obdobi)),
+                              levels = c("period 1", "period 2", "period 3", "period 4", "period 5"),
+                              labels = c("period 1", "period 2", "period 3", "period 4", "period 5"),
+                              ordered = TRUE)) %>% 
+  filter(age_group != "0-4",
+         age_group != "5-9") # removing children 9 years old and younger
+
+# N (%) of unmatched individuals
+N_unmatched <- data_main_analysis %>% 
+  filter(exposure == "exposed") %>% 
+  group_by(cohort, time_period, exposure_definition) %>% 
+  summarise(N_overall = n(),
+            N_unmatched = paste0(sum(number_matched == 0), " (", formatC(round(sum(number_matched == 0)/n()*100, 2), format = "f", digits = 2), ")")) %>% 
+  pivot_wider(names_from = c("exposure_definition"), 
+              values_from = c("N_overall", "N_unmatched")) %>% 
+  select(cohort, time_period, N_overall_diagnosed, N_unmatched_diagnosed, `N_overall_diagnosed and treated`, `N_unmatched_diagnosed and treated`)
+  
+write_csv(N_unmatched, "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Tables/Supplement/N_unmatched.csv")
+
+# sample characteristics: matched vs. unmatched individuals
+descriptives_unmatched <- data_main_analysis %>% 
+  filter(exposure == "exposed") %>% 
+  mutate(matching_success = ifelse(number_matched == 0, "unmatched", "matched")) %>% 
+  group_by(cohort_ICD, matching_success, exposure_definition, time_period) %>% 
+  nest() %>% 
+  mutate(N = map_chr(.x = data,
+                     ~ as.character(length(.x$ID_patient))),
+         female = map_chr(.x = data,
+                          ~ paste0(sum(.x$sex == "Z"), " (", formatC(round(sum(.x$sex == "Z")/length(.x$sex)*100,2), format = "f", digits = 2), ")")),
+         not_vaccinated = map_chr(.x = data,
+                                  ~ paste0(sum(.x$vaccination == "neockovan"), " (", formatC(round(sum(.x$vaccination == "neockovan")/length(.x$vaccination)*100, 2), format = "f", digits = 2), ")")),
+         first_only = map_chr(.x = data,
+                              ~ paste0(sum(.x$vaccination == "pouze prvni davka"), " (", formatC(round(sum(.x$vaccination == "pouze prvni davka")/length(.x$vaccination)*100, 2), format = "f", digits = 2), ")")),
+         first_extra = map_chr(.x = data,
+                               ~ paste0(sum(.x$vaccination == "prvni extra davka"), " (", formatC(round(sum(.x$vaccination == "prvni extra davka")/length(.x$vaccination)*100, 2), format = "f", digits = 2), ")")),
+         complete = map_chr(.x = data,
+                            ~ paste0(sum(.x$vaccination == "ukoncene ockovani"), " (", formatC(round(sum(.x$vaccination == "ukoncene ockovani")/length(.x$vaccination)*100, 2), format = "f", digits = 2), ")")),
+         across(.cols = c(first_only, first_extra, complete, not_vaccinated),
+                ~ ifelse(time_period %in% c("1", "2"), NA, .x)),
+         month_infection = map_chr(.x = data, 
+                                   ~ paste0(median(.x$infection_month), " (", IQR(.x$infection_month), ")")),
+         year_infection = map_chr(.x = data,
+                                  ~ paste0(median(.x$infection_year), " (", IQR(.x$infection_year), ")")),
+         DCCI = map_chr(.x = data,
+                        ~ paste0(round(mean(.x$DCCI), 2), " (", round(sd(.x$DCCI), 2),  ")"))) %>% 
+  select(-data) %>% 
+  ungroup() %>% 
+  pivot_longer(cols = N:DCCI,
+               names_to = "variable") %>% 
+  pivot_wider(names_from = c("cohort_ICD", "matching_success"), 
+              values_from = c("value")) %>%
+  mutate(time_period = str_remove(time_period, "period ")) %>% 
+  select(time_period, variable, exposure_definition, 
+         Fx_unmatched, Fx_matched, F1_unmatched, F1_matched, F2_unmatched, F2_matched, F3_unmatched, F3_matched, F4_unmatched, F4_matched) %>% 
+  arrange(exposure_definition, time_period) %>% 
+  filter(!((time_period %in% c("1", "2")) & (variable %in% c("not_vaccinated", "first_only", "first_extra", "complete"))))
+
+write_csv(descriptives_unmatched, "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Tables/descriptives_unmatched.csv")
+
+# excluding unmatched individuals
+data_main_analysis <- data_main_analysis %>% 
+  filter(number_matched != 0) 
+ 
+
+
+
+### SANITY CHECK ###
+
+# checking the matching success per matching variable (e.g., co-morbidity index DCCI)
+data_main_analysis %>%  
+  group_by(cohort, time_period, exposure_definition, matching) %>% 
+  summarise(cond = all(DCCI_cat == first(DCCI_cat))) %>% # change the matching variable (age_cat, sex, vaccination, infection_month, infection_year)
+  count(cond) %>%
+  print(n = 50)
+
+# checking the number of matched individuals within each stratum
+n_matched_strata <- data_main_analysis %>% 
+  group_by(cohort, time_period, exposure_definition, matching) %>% 
+  count() %>% 
+  ungroup() 
+
+n_matched_strata %>% 
+ count(n)
+
+# checking the outcomes
+data_main_analysis %>% 
+  select(ID_patient,ends_with(c("death_covid_60", "death_covid_28", "death_allcause_60", "death_allcause_28"))) %>% 
+  filter(death_allcause_60 == 1,
+         time_to_death_allcause_60 > 28) 
+
+
+data_main_analysis %>% 
+  group_by(cohort, time_period, exposure_definition, exposure) %>% 
+  summarise(aaa = sum(death_allcause_60 == 1),
+            bbb = length(ID_pacienta))
+
+
+
+
+### DESCRIPTIVES ###
+
+cohort_characteristics <- data_main_analysis %>% 
+  group_by(cohort_ICD, exposure, exposure_definition, time_period) %>% 
+  nest() %>% 
+  mutate(N = map_chr(.x = data,
+                     ~ as.character(length(.x$ID_patient))),
+         female = map_chr(.x = data,
+                           ~ paste0(sum(.x$sex == "Z"), " (", formatC(round(sum(.x$sex == "Z")/length(.x$sex)*100,2), format = "f", digits = 2), ")")),
+         not_vaccinated = map_chr(.x = data,
+                  ~ paste0(sum(.x$vaccination == "neockovan"), " (", formatC(round(sum(.x$vaccination == "neockovan")/length(.x$vaccination)*100, 2), format = "f", digits = 2), ")")),
+         first_only = map_chr(.x = data,
+                                  ~ paste0(sum(.x$vaccination == "pouze prvni davka"), " (", formatC(round(sum(.x$vaccination == "pouze prvni davka")/length(.x$vaccination)*100, 2), format = "f", digits = 2), ")")),
+         first_extra = map_chr(.x = data,
+                              ~ paste0(sum(.x$vaccination == "prvni extra davka"), " (", formatC(round(sum(.x$vaccination == "prvni extra davka")/length(.x$vaccination)*100, 2), format = "f", digits = 2), ")")),
+         complete = map_chr(.x = data,
+                              ~ paste0(sum(.x$vaccination == "ukoncene ockovani"), " (", formatC(round(sum(.x$vaccination == "ukoncene ockovani")/length(.x$vaccination)*100, 2), format = "f", digits = 2), ")")),
+         across(.cols = c(first_only, first_extra, complete, not_vaccinated),
+                ~ ifelse(time_period %in% c("1", "2"), NA, .x)),
+         month_infection = map_chr(.x = data, 
+                                  ~ paste0(median(.x$infection_month), " (", IQR(.x$infection_month), ")")),
+         year_infection = map_chr(.x = data,
+                                   ~ paste0(median(.x$infection_year), " (", IQR(.x$infection_year), ")")),
+         DCCI = map_chr(.x = data,
+                        ~ paste0(round(mean(.x$DCCI), 2), " (", round(sd(.x$DCCI), 2),  ")"))) %>% 
+  select(-data) %>% 
+  ungroup() %>% 
+  pivot_longer(cols = N:DCCI,
+               names_to = "variable") %>% 
+  pivot_wider(names_from = c("cohort_ICD", "exposure"), 
+              values_from = c("value")) %>%
+  mutate(time_period = str_remove(time_period, "period ")) %>% 
+  select(time_period, variable, exposure_definition,
+         Fx_control, Fx_exposed, F1_control, F1_exposed, F2_control, F2_exposed, F3_control, F3_exposed, F4_control, F4_exposed) %>% 
+  arrange(exposure_definition, time_period) %>% 
+  filter(!((time_period %in% c("1", "2")) & (variable %in% c("not_vaccinated", "first_only", "first_extra", "complete"))))
+  
+write_csv(cohort_characteristics, "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Tables/descriptives.csv")
+
+
+### DESCRIPTIVES FOR ADDITIONAL COVARIATES ###
+
+descriptives_contacts <- data_main_analysis %>% 
+  select(cohort_ICD, exposure, exposure_definition, time_period,
+         number_inpatient, number_outpatient) %>% 
+  group_by(cohort_ICD, exposure, exposure_definition, time_period) %>% 
+  summarise(across(c("number_inpatient", "number_outpatient"),
+                   ~ paste0(formatC(round(mean(.x), 2), format = "f", digits = 2), " (", formatC(round(sd(.x), 2), format = "f", digits = 2),  ")"))) %>% 
+  ungroup()
+
+descriptives_covariates <- data_main_analysis %>% 
+  select(cohort_ICD, exposure, exposure_definition, time_period,
+         region_residence, ends_with("1rokpred")) %>% 
+  fastDummies::dummy_cols(select_columns = "region_residence") %>%
+  mutate(across(.cols = c(starts_with("region_"), ends_with("1rokpred")),
+                ~ as.double(.x))) %>% 
+  select(-c("region_residence")) %>% 
+  group_by(cohort_ICD, exposure, exposure_definition, time_period) %>% 
+  summarise(across(.cols = c(starts_with("region_"), ends_with("1rokpred")),
+                   ~ paste0(sum(.x == 1), " (", formatC(round(sum(.x == 1)/length(.x)*100,2), format = "f", digits = 2), ")"))) %>% 
+  ungroup() %>%
+  merge(descriptives_contacts, by = c("cohort_ICD", "exposure", "exposure_definition", "time_period")) %>% 
+  as_tibble() %>% 
+  pivot_longer(cols = region_residence_CZ010:number_outpatient,
+               names_to = "variable") %>% 
+  pivot_wider(names_from = c("cohort_ICD", "exposure"), 
+              values_from = c("value")) %>%
+  mutate(time_period = str_remove(time_period, "period ")) %>% 
+  select(time_period, variable, exposure_definition,
+         Fx_control, Fx_exposed, F1_control, F1_exposed, F2_control, F2_exposed, F3_control, F3_exposed, F4_control, F4_exposed) %>% 
+  arrange(exposure_definition, time_period) %>% 
+  mutate(variable = str_remove(variable, "region_residence_"),
+         variable = str_remove(variable, "_1rokpred"),
+         variable = case_when(variable == "CZ031" ~	"South-Bohemian region",
+                              variable == "CZ064" ~	"South-Moravian region",
+                              variable == "CZ041"	~ "Karlovy Vary region",
+                              variable == "CZ052"	~ "Hradec Kralove region",
+                              variable == "CZ051"	~ "Liberec region",
+                              variable == "CZ080"	~ "Moravian-Silesian region",
+                              variable == "CZ071"	~ "Olomouc region",
+                              variable == "CZ053"	~ "Pardubice region",
+                              variable == "CZ032"	~ "Plzen region",
+                              variable == "CZ010"	~ "Prague region",
+                              variable == "CZ020"	~ "Central-Bohemian region",
+                              variable == "CZ042"	~ "Usti region",
+                              variable == "CZ063"	~ "Vysocina region",
+                              variable == "CZ072" ~	"Zlin region",
+                              variable == "CZ099" ~ "living abroad",
+                              variable == "C02" ~ "antihypertensives", 
+                              variable == "B01AC06_N02BA01_N02BA51" ~ "aspirin", 
+                              variable == "C10AA" ~ "statins",
+                              variable == "B01" ~ "antithrombotic agents",
+                              variable == "M01A" ~ "non-steroidal anti-inflammatory medications",
+                              variable == "M05BA_M05BB" ~ "bisphosphonates",
+                              variable == "G03A" ~ "oral contraceptives", 
+                              variable == "G03C_G03D_G03F" ~ "hormone replacement therapy",
+                              variable == "N03" ~ "anticonvulsants",
+                              variable == "L01A_L01B_L01C_L01D_L01E_L01X" ~ "cytostatic chemotherapy",
+                              variable == "V10" ~ "radiotherapy",
+                              variable == "L04" ~ "immunosuppressant medication",
+                              variable == "R03AC13_R03AC12" ~ "long-acting beta-agonist" ,
+                              variable == "R03DC" ~ "leukotriene receptor antagonists",
+                              variable == "R03BA" ~ "inhaled glucocorticoids",
+                              variable == "number_outpatient" ~ "number_outpatient",
+                              variable == "number_inpatient" ~ "number_inpatient"))
+
+write_csv(descriptives_covariates, "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Tables/descriptives_covariates.csv")
+
+
+
+
+
+### MAIN ANALYSIS ###
+
+# absolute risk
+absolute_risk <- data_main_analysis %>% 
+  group_by(cohort, time_period, exposure_definition, exposure) %>% 
+  summarise(N = length(ID_patient),
+            across(c("death_allcause_28", "death_allcause_60", "death_covid_28", "death_covid_60"), 
+                   ~ paste0(sum(.x == 1), " (", formatC(round(sum(.x == 1)/length(.x)*100,2), format = "f", digits = 2), ")"))) %>% 
+  pivot_wider(names_from = c("exposure"), 
+              values_from = c("N", starts_with("death"))) %>% 
+  arrange(exposure_definition)
+
+write_csv(absolute_risk, "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Tables/Supplement/absolute_risk.csv")
+
+
+
+### SURVIVAL MODELS ###
+
+# pre-vaccination period
+models_pre_vacc <- data_main_analysis %>% 
+  filter(time_period %in% c("period 1", "period 2")) %>% 
+  group_by(cohort, exposure_definition, time_period) %>% 
+  nest() %>%  
+  mutate(covid_28 = map(.x = data,
+                        ~ coxph(Surv(time_to_death_covid_28, death_covid_28) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching),
+                                data = .x)),
+         covid_60 = map(.x = data,
+                        ~ coxph(Surv(time_to_death_covid_60, death_covid_60) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching),
+                                data = .x)),
+         all_cause_28 = map(.x = data,
+                            ~ coxph(Surv(time_to_death_allcause_28, death_allcause_28) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching),
+                                    data = .x)),
+         all_cause_60 = map(.x = data,
+                            ~ coxph(Surv(time_to_death_allcause_60, death_allcause_60) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching),
+                                    data = .x)),
+         covid_28_adj = map(.x = data,
+                            ~ coxph(Surv(time_to_death_covid_28, death_covid_28) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching) 
+                                    + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                data = .x)),
+         covid_60_adj = map(.x = data,
+                            ~ coxph(Surv(time_to_death_covid_60, death_covid_60) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching)
+                                    + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                data = .x)),
+         all_cause_28_adj = map(.x = data,
+                                ~ coxph(Surv(time_to_death_allcause_28, death_allcause_28) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching)
+                                        + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                    data = .x)),
+         all_cause_60_adj = map(.x = data,
+                                ~ coxph(Surv(time_to_death_allcause_60, death_allcause_60) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching)
+                                        + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                    data = .x)))
+
+# vaccination period
+models_vacc <- data_main_analysis %>% 
+  filter(time_period %in% c("period 3", "period 4", "period 5")) %>% 
+  group_by(cohort, exposure_definition, time_period) %>% 
+  nest() %>%  
+  mutate(covid_28 = map(.x = data,
+                        ~ coxph(Surv(time_to_death_covid_28, death_covid_28) ~ exposure + age_group + vaccination + sex + infection_year + infection_month + DCCI + strata(matching),
+                                data = .x)),
+         covid_60 = map(.x = data,
+                        ~ coxph(Surv(time_to_death_covid_60, death_covid_60) ~ exposure + age_group + vaccination + sex + infection_year + infection_month + DCCI + strata(matching),
+                                data = .x)),
+         all_cause_28 = map(.x = data,
+                            ~ coxph(Surv(time_to_death_allcause_28, death_allcause_28) ~ exposure + age_group + vaccination + sex + infection_year + infection_month + DCCI + strata(matching),
+                                    data = .x)),
+         all_cause_60 = map(.x = data,
+                            ~ coxph(Surv(time_to_death_allcause_60, death_allcause_60) ~ exposure + age_group + vaccination + sex + infection_year + infection_month + DCCI + strata(matching),
+                                    data = .x)),
+         covid_28_adj = map(.x = data,
+                            ~ coxph(Surv(time_to_death_covid_28, death_covid_28) ~ exposure + age_group + vaccination + sex + infection_year + infection_month + DCCI + strata(matching) 
+                                    + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                    data = .x)),
+         covid_60_adj = map(.x = data,
+                            ~ coxph(Surv(time_to_death_covid_60, death_covid_60) ~ exposure + age_group + vaccination + sex + infection_year + infection_month + DCCI + strata(matching)
+                                    + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                    data = .x)),
+         all_cause_28_adj = map(.x = data,
+                                ~ coxph(Surv(time_to_death_allcause_28, death_allcause_28) ~ exposure + age_group + vaccination + sex + infection_year + infection_month + DCCI + strata(matching)
+                                        + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                        data = .x)),
+         all_cause_60_adj = map(.x = data,
+                                ~ coxph(Surv(time_to_death_allcause_60, death_allcause_60) ~ exposure + age_group + vaccination + sex + infection_year + infection_month + DCCI + strata(matching)
+                                        + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                        data = .x)))
+         
+         
+models_results <- bind_rows(models_pre_vacc, models_vacc) %>% 
+  pivot_longer(cols = covid_28:all_cause_60_adj,
+               names_to = "mortality") %>%
+  mutate(model_estimates = map(.x = value,
+                               ~ .x %>% tidy(conf.int = TRUE, 
+                                             exponentiate = TRUE) %>%
+                                 filter(term == "exposureexposed") %>% 
+                                 select(estimate, conf.low, conf.high))) %>% 
+  select(cohort, time_period, mortality, model_estimates) %>% 
+  unnest() %>% 
+  mutate(follow_up = str_extract(mortality, "28|60"),
+         adjusted = factor(ifelse(is.na(str_extract(mortality, "adj")), "raw", "adjusted"), ordered = TRUE),
+         mortality = str_extract(mortality, "covid|all_cause"),
+         mortality = ifelse(mortality == "covid", "COVID-19 mortality", "All-cause mortality"),
+         cohort_time = as.factor(paste0(cohort, ": ", time_period)),
+         results = paste0(formatC(round(estimate, 2), format = "f", digits = 2), 
+                          " (", formatC(round(conf.low, 2), format = "f", digits = 2), ", ", 
+                          formatC(round(conf.high, 2), format = "f", digits = 2), ")"),
+         results = ifelse(str_detect(results, "Inf"), "NA", results),
+         across(.cols = c(estimate, conf.low, conf.high),
+                ~ ifelse(results == "NA", NA, .x)),
+         order_cohort = as.numeric(cohort),
+         order_time_period = as.numeric(time_period)) %>% 
+  arrange(order_cohort, order_time_period)
+
+main_results_table <- models_results %>% 
+  select(cohort, time_period, mortality, follow_up, exposure_definition, adjusted, results) %>% 
+  pivot_wider(names_from = c("follow_up", "adjusted", "exposure_definition"),
+              values_from = "results") %>% 
+  mutate(time_period = str_remove(time_period, "period ")) %>% 
+  arrange(mortality) %>% 
+    select(cohort, time_period, mortality, 
+           '28_raw_diagnosed', '28_adjusted_diagnosed', '28_raw_diagnosed and treated', '28_adjusted_diagnosed and treated',
+           '60_raw_diagnosed', '60_adjusted_diagnosed', '60_raw_diagnosed and treated', '60_adjusted_diagnosed and treated')
+           
+write_csv(main_results_table, "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Tables/main_results.csv")
+
+
+
+ 
+### PLOTTING ###
+
+
+my_colors2   <- c("up to 28 days" ="#0072B2", 
+                  "up to 60 days" = "#D55E00")   
+
+font_import()
+y
+loadfonts(device="win")
+windowsFonts(Times = windowsFont("Times New Roman"))
+
+# All-cause mortality
+plot_allcause <- models_results %>% 
+  mutate(follow_up = ifelse(follow_up == "28", "up to 28 days", "up to 60 days")) %>% 
+  filter(adjusted == "adjusted",
+         mortality == "All-cause mortality",
+         cohort_time != "psychotic disorders: period 1",
+         cohort_time != "substance use disorders: period 1") %>% 
+  arrange(order_cohort, order_time_period) %>% 
+  ggplot(aes(x = time_period,
+             y = estimate,
+             color = follow_up)) +
+  geom_point(size = 3,
+             position = position_dodge(width = 0.4)) +
+  scale_color_manual(values = my_colors2) +
+  geom_errorbar(aes(ymin = conf.low,
+                    ymax = conf.high),
+                linewidth = 1,
+                width = 0.25,
+                position = position_dodge(width = 0.4)) +
+  scale_y_continuous(trans = "log10", 
+                     limit = c(0.4, 3.4), 
+                     breaks = c(0.5, 1, 2, 3)) +
+  geom_hline(yintercept = 1, 
+             linetype = 2,
+             linewidth = 0.5) +
+  labs(x = "",
+       y = "adjusted hazard ratio (95% confidence interval)",
+       color = "Follow-up period",
+       title = "Relative risk of all-cause mortality following SARS-CoV-2 infection in people with pre-existing mental disorders") +
+  theme_minimal() +
+  ggh4x::facet_nested_wrap(~ cohort + exposure_definition,
+                           scales = "free",
+                           nrow = 5,
+                           strip = ggh4x::strip_nested(text_x = ggh4x::elem_list_text(face = c("bold", "plain")),
+                                                       by_layer_x = TRUE)) +
+  theme(panel.spacing = unit(3, "lines"),
+        plot.title = element_text(size = 22,
+                                  face = "bold",
+                                  hjust = 0.5),
+        plot.subtitle = element_text(size = 20,
+                                     hjust = 0.5),
+        legend.position="bottom",
+        legend.text=element_text(size=18),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.text.y = element_text(hjust=0),
+        text = element_text(size=22,
+                            family = "Times"),
+        axis.line.x = element_line(color="black", linewidth = 1),
+        axis.line.y = element_line(color="black", linewidth = 1)) +
+  guides(col = guide_legend(title.position = "top", title.hjust =0.5, 
+                            title.theme = element_text(size = 18)))
+
+ggsave(filename = "plot_allcause.eps",
+       path = "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Graphs", 
+       width = 24, 
+       height = 16, 
+       device= cairo_ps, 
+       bg="white",
+       dpi=700)
+
+
+
+# COVID-19 mortality
+plot_covid19 <- models_results %>% 
+  mutate(follow_up = ifelse(follow_up == "28", "up to 28 days", "up to 60 days")) %>% 
+  filter(adjusted == "adjusted",
+         mortality == "COVID-19 mortality",
+         cohort_time != "psychotic disorders: period 1",
+         cohort_time != "substance use disorders: period 1") %>% 
+  arrange(order_cohort, order_time_period) %>% 
+  ggplot(aes(x = time_period,
+             y = estimate,
+             color = follow_up)) +
+  geom_point(size = 3,
+             position = position_dodge(width = 0.4)) +
+  scale_color_manual(values = my_colors2) +
+  geom_errorbar(aes(ymin = conf.low,
+                    ymax = conf.high),
+                linewidth = 1,
+                width = 0.25,
+                position = position_dodge(width = 0.4)) +
+  scale_y_continuous(trans = "log10", 
+                     limit = c(0.45, 4.4), 
+                     breaks = c(0.5, 1, 2, 3)) +
+  geom_hline(yintercept = 1, 
+             linetype = 2,
+             linewidth = 0.5) +
+  labs(x = "",
+       y = "adjusted hazard ratio (95% confidence interval)",
+       color = "Follow-up period",
+       title = "Relative risk of COVID-19 mortality following SARS-CoV-2 infection in people with pre-existing mental disorders") +
+  theme_minimal() +
+  ggh4x::facet_nested_wrap(~ cohort + exposure_definition,
+                           scales = "free",
+                           nrow = 5,
+                           strip = ggh4x::strip_nested(text_x = ggh4x::elem_list_text(face = c("bold", "plain")),
+                                                       by_layer_x = TRUE)) +
+  theme(panel.spacing = unit(3, "lines"),
+        plot.title = element_text(size = 22,
+                                  face = "bold",
+                                  hjust = 0.5),
+        plot.subtitle = element_text(size = 20,
+                                     hjust = 0.5),
+        legend.position="bottom",
+        legend.text=element_text(size=18),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.text.y = element_text(hjust=0),
+        text = element_text(size=22,
+                            family = "Times"),
+        axis.line.x = element_line(color="black", linewidth = 1),
+        axis.line.y = element_line(color="black", linewidth = 1)) +
+  guides(col = guide_legend(title.position = "top", title.hjust =0.5, 
+                            title.theme = element_text(size = 18)))
+
+ggsave(filename = "plot_covid19.eps",
+       path = "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Graphs", 
+       width = 24, 
+       height = 16, 
+       device= cairo_ps, 
+       bg="white",
+       dpi=700)
+
+
+### TESTING MODEL ASSUMPTIONS: SCHOENFELD RESIDUALS ###
+schoenfeld_residuals <- data_main_analysis %>% 
+  group_by(cohort, time_period) %>% 
+  nest() %>%   
+  mutate(covid_28 = map(.x = data,
+                        ~ cox.zph(coxph(Surv(time_to_death_covid_28, death_covid_28) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching),
+                                        data = .x))),
+         covid_60 = map(.x = data,
+                        ~ cox.zph(coxph(Surv(time_to_death_covid_60, death_covid_60) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching),
+                                        data = .x))),
+         all_cause_28 = map(.x = data,
+                            ~ cox.zph(coxph(Surv(time_to_death_allcause_28, death_allcause_28) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching),
+                                            data = .x))),
+         all_cause_60 = map(.x = data,
+                            ~ cox.zph(coxph(Surv(time_to_death_allcause_60, death_allcause_60) ~ exposure + age_group + sex + infection_year + infection_month + DCCI + strata(matching),
+                                            data = .x))),
+         across(ends_with(c("_60", "_28")),
+                ~ as.data.frame(.x$table)$p[[1]] < 0.05))
+
+
+# KAPLAN MEIER PLOTS
+KM_models <- data_main_analysis %>% 
+  group_by(cohort, time_period, exposure_definition) %>% 
+  nest() %>%   
+  mutate(covid_28 = map(.x = data,
+                        ~ survfit(Surv(time_to_death_covid_28, death_covid_28) ~ exposure, data = .x)),
+         covid_60 = map(.x = data,
+                        ~ survfit(Surv(time_to_death_covid_60, death_covid_60) ~ exposure, data = .x)),
+         all_cause_28 = map(.x = data,
+                            ~ survfit(Surv(time_to_death_allcause_28, death_allcause_28) ~ exposure, data = .x)),
+         all_cause_60 = map(.x = data,
+                            ~ survfit(Surv(time_to_death_allcause_60, death_allcause_60) ~ exposure, data = .x)))
+
+KM_plots <- KM_models %>%   
+  mutate(title_name = list(cohort),
+         exp_def = list(case_when(exposure_definition == "diagnosed" ~ "(diagnosed)",
+                                  exposure_definition == "diagnosed and treated" ~ "(diagnosed and treated)")),
+         time_name = list(as.character(time_period)),
+         plot_name = paste(cohort, exposure_definition, time_period, ".eps", sep = "_")) %>% 
+  mutate(KM_covid_28 = pmap(across(c(covid_28, data, title_name, exp_def, time_name)),
+                            ~ ggsurvplot(fit = ..1,
+                                         data = ..2,
+                                         title = paste0("COVID-19 mortality up to 28 days in people with ", ..3, " ", ..4, " in time period ", ..5),
+                                         fun = "event",
+                                         legend.title	= "",
+                                         legend.labs = c(paste0("Matched counterparts without ", ..3), paste0("Individuals with ", ..3)),
+                                         ylab = "Cumulative event (95% CI)",
+                                         tables.y.text.col = FALSE,
+                                         risk.table = TRUE,
+                                         cumevents = TRUE,
+                                         cumcensor = TRUE,
+                                         censor = FALSE,
+                                         tables.height = 0.15,
+                                         conf.int = TRUE)),
+         KM_covid_60 = pmap(across(c(covid_60, data, title_name, exp_def, time_name)),
+                            ~ ggsurvplot(fit = ..1,
+                                         data = ..2,
+                                         title = paste0("COVID-19 mortality up to 60 days in people with ", ..3, " ", ..4, " in time period ", ..5),
+                                         fun = "event",
+                                         legend.title	= "",
+                                         legend.labs = c(paste0("Matched counterparts without ", ..3), paste0("Individuals with ", ..3)),
+                                         ylab = "Cumulative event (95% CI)",
+                                         tables.y.text.col = FALSE,
+                                         risk.table = TRUE,
+                                         cumevents = TRUE,
+                                         cumcensor = TRUE,
+                                         censor = FALSE,
+                                         tables.height = 0.15,
+                                         conf.int = TRUE)),
+         KM_allcause_28 = pmap(across(c(all_cause_28, data, title_name, exp_def, time_name)),
+                               ~ ggsurvplot(fit = ..1,
+                                            data = ..2,
+                                            title = paste0("All-cause mortality up to 28 days in people with ", ..3, " ", ..4, " in time period ", ..5),
+                                            fun = "event",  
+                                            legend.title	= "",
+                                            legend.labs = c(paste0("Matched counterparts without ", ..3), paste0("Individuals with ", ..3)),
+                                            ylab = "Cumulative event (95% CI)",
+                                            tables.y.text.col = FALSE,
+                                            risk.table = TRUE,
+                                            cumevents = TRUE,
+                                            cumcensor = TRUE,
+                                            censor = FALSE,
+                                            tables.height = 0.15,
+                                            conf.int = TRUE)),
+         KM_allcause_60 = pmap(across(c(all_cause_60, data, title_name, exp_def, time_name)),
+                               ~ ggsurvplot(fit = ..1,
+                                            data = ..2,
+                                            title = paste0("All-cause mortality up to 60 days in people with ", ..3, " ", ..4, " in time period ", ..5),
+                                            fun = "event",
+                                            legend.title	= "",
+                                            legend.labs = c(paste0("Matched counterparts without ", ..3), paste0("Individuals with ", ..3)),
+                                            ylab = "Cumulative event (95% CI)",
+                                            tables.y.text.col = FALSE,
+                                            risk.table = TRUE,
+                                            cumevents = TRUE,
+                                            cumcensor = TRUE,
+                                            censor = FALSE,
+                                            tables.height = 0.15,
+                                            conf.int = TRUE)))
+
+
+pwalk(list(KM_plots$plot_name, KM_plots$KM_covid_28),
+      ggsave, 
+      path = "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Graphs/Supplement/covid_28", 
+      width = 24, 
+      height = 16, 
+      device= cairo_ps,
+      dpi=700)
+
+pwalk(list(KM_plots$plot_name, KM_plots$KM_covid_60),
+      ggsave, 
+      path = "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Graphs/Supplement/covid_60", 
+      width = 24, 
+      height = 16, 
+      device= cairo_ps,
+      dpi=700)
+
+pwalk(list(KM_plots$plot_name, KM_plots$KM_allcause_28),
+      ggsave, 
+      path = "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Graphs/Supplement/allcause_28", 
+      width = 24, 
+      height = 16, 
+      device= cairo_ps,
+      dpi=700)
+
+pwalk(list(KM_plots$plot_name, KM_plots$KM_allcause_60),
+      ggsave, 
+      path = "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Graphs/Supplement/allcause_60", 
+      width = 24, 
+      height = 16, 
+      device= cairo_ps,
+      dpi=700)
+
+
+
+
+
+
+
+###################
+### SUPPLEMENT ###
+##################
+
+### NEGATIVE CONTROL ANALYSIS ###
+sensitivity_pre_vacc <- data_main_analysis %>%
+  filter(time_period %in% c("period 1", "period 2")) %>% # pre-vaccination period
+  filter(!(cohort == "psychotic disorders" & time_period ==  "period 1"),
+         !(cohort == "substance use disorders" & time_period ==  "period 1")) %>% 
+  pivot_longer(cols = ends_with("_5letpred"),
+               names_to = "condition_type", 
+               values_to = "condition_binary") %>%  
+  mutate(condition_type = str_remove(condition_type, "_5letpred")) %>% 
+  group_by(time_period, condition_type, cohort, exposure_definition) %>% 
+  nest() %>%   
+  mutate(covid_28 = map(.x = data,
+                        ~ coxph(Surv(time_to_death_covid_28, death_covid_28) ~ condition_binary + age_group + sex + infection_year + infection_month + DCCI + strata(matching) 
+                                + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                data = .x)),
+         covid_60 = map(.x = data,
+                        ~ coxph(Surv(time_to_death_covid_60, death_covid_60) ~ condition_binary + age_group + sex + infection_year + infection_month + DCCI + strata(matching) 
+                                + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                data = .x)),
+         all_cause_28 = map(.x = data,
+                            ~ coxph(Surv(time_to_death_allcause_28, death_allcause_28) ~ condition_binary + age_group + sex + infection_year + infection_month + DCCI + strata(matching) 
+                                    + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                    data = .x)),
+         all_cause_60 = map(.x = data,
+                            ~ coxph(Surv(time_to_death_allcause_60, death_allcause_60) ~ condition_binary + age_group + sex + infection_year + infection_month + DCCI + strata(matching) 
+                                    + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                    data = .x)))
+
+sensitivity_vacc <- data_main_analysis %>%
+  filter(time_period %in% c("period 3", "period 4", "period 5")) %>% # vaccination period
+  pivot_longer(cols = ends_with("_5letpred"),
+               names_to = "condition_type",
+               values_to = "condition_binary") %>%  
+  mutate(condition_type = str_remove(condition_type, "_5letpred")) %>% 
+  group_by(time_period, condition_type, cohort, exposure_definition) %>% 
+  nest() %>%   
+  mutate(covid_28 = map(.x = data,
+                        ~ coxph(Surv(time_to_death_covid_28, death_covid_28) ~ condition_binary + vaccination + age_group + sex + infection_year + infection_month + DCCI + strata(matching) 
+                                + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                data = .x)),
+         covid_60 = map(.x = data,
+                        ~ coxph(Surv(time_to_death_covid_60, death_covid_60) ~ condition_binary + vaccination + age_group + sex + infection_year + infection_month + DCCI + strata(matching) 
+                                + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                data = .x)),
+         all_cause_28 = map(.x = data,
+                            ~ coxph(Surv(time_to_death_allcause_28, death_allcause_28) ~ condition_binary + vaccination + age_group + sex + infection_year + infection_month + DCCI + strata(matching) 
+                                    + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                    data = .x)),
+         all_cause_60 = map(.x = data,
+                            ~ coxph(Surv(time_to_death_allcause_60, death_allcause_60) ~ condition_binary + vaccination + age_group + sex + infection_year + infection_month + DCCI + strata(matching) 
+                                    + region_residence + number_outpatient + number_inpatient + C02_1rokpred + B01AC06_N02BA01_N02BA51_1rokpred + C10AA_1rokpred + B01_1rokpred + M01A_1rokpred + M05BA_M05BB_1rokpred + G03A_1rokpred + G03C_G03D_G03F_1rokpred + N03_1rokpred + L01A_L01B_L01C_L01D_L01E_L01X_1rokpred + V10_1rokpred + L04_1rokpred + R03AC13_R03AC12_1rokpred + R03DC_1rokpred + R03BA_1rokpred,
+                                    data = .x)))
+
+sensitivity_results <- bind_rows(sensitivity_pre_vacc, sensitivity_vacc) %>% 
+  pivot_longer(cols = covid_28:all_cause_60,
+               names_to = "mortality") %>%
+  mutate(model_estimates = map(.x = value,
+                               ~ .x %>% tidy(conf.int = TRUE, 
+                                             exponentiate = TRUE) %>%
+                                 filter(term == "condition_binary") %>% 
+                                 select(estimate, conf.low, conf.high))) %>% 
+  select(condition_type, cohort, time_period, mortality, model_estimates) %>%
+  unnest() %>% 
+  ungroup() %>% 
+  na.omit() %>% 
+  filter(!is.infinite(conf.high)) %>% 
+  group_by(cohort, time_period) %>%
+  summarise(n_test = n(),
+            non_null_test = n_test - sum(conf.low < 1 & conf.high > 1),
+            prop_non_null_test = formatC(round(non_null_test/n_test*100, 2), format = "f", digits = 2),
+            mean_estimate = formatC(round(mean(estimate),2), format = "f", digits = 2))
+
+write_csv(sensitivity_results, "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Tables/Supplement/negative_control.csv")
+
+
+
+### E-VALUES ###
+E_values <- models_results %>%
+  select(-results) %>% 
+  ungroup() %>% 
+  filter(!is.na(estimate)) %>% 
+  mutate(E_value = pmap_dbl(across(c(estimate, conf.low, conf.high)), 
+                        ~ as_tibble(evalues.HR(..1, ..2, ..3, rare = TRUE))$point[[2]]),
+         E_value = ifelse(conf.low < 1 & conf.high > 1, NA, E_value)) %>% 
+  select(cohort, time_period, mortality, follow_up, exposure_definition, adjusted, E_value) %>%
+  mutate(E_value = formatC(round(E_value, 2), format = "f", digits = 2)) %>% 
+  pivot_wider(names_from = c("follow_up", "adjusted", "exposure_definition"),
+              values_from = "E_value") %>% 
+  arrange(mortality) %>% 
+  select(cohort, time_period, mortality, 
+         '28_raw_diagnosed', '28_adjusted_diagnosed', '28_raw_diagnosed and treated', '28_adjusted_diagnosed and treated',
+         '60_raw_diagnosed', '60_adjusted_diagnosed', '60_raw_diagnosed and treated', '60_adjusted_diagnosed and treated')
+
+write_csv(E_values, "C:/Tomas/AZV_project_health_registers_covid_mortality/Results/Tables/Supplement/E_values.csv")
+
